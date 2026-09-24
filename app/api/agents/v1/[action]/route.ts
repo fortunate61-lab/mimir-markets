@@ -28,7 +28,7 @@ import {
 } from "@/lib/db";
 import {
   AUTHORITY_LEVELS, REGISTRY_SCHEMA_VERSION, authorizeAction, defaultLimits,
-  revokeAgent, type AgentRecord, type AgentCapability,
+  evaluateRegistrationReplay, revokeAgent, type AgentRecord, type AgentCapability,
 } from "@/lib/agents/registry";
 import { auditAgentRequest, consumeNonce, loadAgent, loadIdempotentResponse, saveAgent, saveIdempotentResponse } from "@/lib/agents/store";
 import { buildAgentDryRun } from "@/lib/agents/dry-run";
@@ -101,8 +101,45 @@ async function register(request: SignedAgentRequest<Record<string, any>>): Promi
   if (!(await verify(operator, operatorProofMessage, String(body.operatorSignature ?? "")))) {
     return json({ error: { message: "operator signature rejected" } }, 401);
   }
-  if (!(await consumeNonce(request.agentId, request.nonce, Date.now()))) return json({ error: { message: "nonce replay" } }, 409);
-  if (await loadAgent(request.agentId)) return json({ error: { message: "agent already registered" } }, 409);
+
+  // Safe client retries: same idempotency key returns the prior accepted body.
+  if (request.idempotencyKey) {
+    const prior = await loadIdempotentResponse(request.agentId, "register", request.idempotencyKey);
+    if (prior) return json(prior.body, prior.status);
+  }
+
+  const payoutWallet = isWalletAddress(normalizeWallet(String(body.payoutWallet ?? "")))
+    ? normalizeWallet(String(body.payoutWallet)) : owner;
+
+  // Duplicate register with the same wallets is success, not conflict — check
+  // identity BEFORE consuming the nonce so a retry of a successful admission is
+  // not rejected as "nonce replay".
+  const existing = await loadAgent(request.agentId);
+  if (existing) {
+    const replay = evaluateRegistrationReplay(existing, {
+      ownerWallet: owner, operatorWallet: operator, payoutWallet,
+    });
+    if (replay.ok) {
+      const payload = { agent: existing };
+      if (request.idempotencyKey) {
+        await saveIdempotentResponse(request.agentId, "register", request.idempotencyKey, payload, 200);
+      }
+      await audit(request, "registered_idempotent");
+      return json(payload);
+    }
+    await audit(request, "rejected", replay.reason);
+    return json({
+      error: {
+        message: "agent already registered",
+        reason: replay.reason,
+        detail: "a different owner, operator, or payout wallet claimed this agentId",
+      },
+    }, 409);
+  }
+
+  if (!(await consumeNonce(request.agentId, request.nonce, Date.now()))) {
+    return json({ error: { message: "nonce replay" } }, 409);
+  }
   const now = Date.now();
   const authority = Math.max(0, Math.min(4, Math.floor(Number(body.authorityLevel ?? 0)))) as AgentRecord["authorityLevel"];
   const requestedCapabilities = Array.isArray(body.capabilities) ? body.capabilities : [];
@@ -111,8 +148,7 @@ async function register(request: SignedAgentRequest<Record<string, any>>): Promi
   const agent: AgentRecord = {
     schemaVersion: REGISTRY_SCHEMA_VERSION, agentId: request.agentId, ownerWallet: owner,
     operatorWallet: operator,
-    payoutWallet: isWalletAddress(normalizeWallet(String(body.payoutWallet ?? "")))
-      ? normalizeWallet(String(body.payoutWallet)) : owner,
+    payoutWallet,
     displayName: String(body.displayName ?? request.agentId).slice(0, 80),
     description: String(body.description ?? "").slice(0, 500),
     metadataUri: body.metadataUri ? String(body.metadataUri) : undefined,
@@ -126,8 +162,12 @@ async function register(request: SignedAgentRequest<Record<string, any>>): Promi
     authorizeAction(agent, { capability, positionUsdc: 0 }).allowed ||
     (capability === "market_creator" && authority >= AUTHORITY_LEVELS.PROPOSE));
   await saveAgent(agent);
+  const payload = { agent };
+  if (request.idempotencyKey) {
+    await saveIdempotentResponse(request.agentId, "register", request.idempotencyKey, payload, 200);
+  }
   await audit(request, "registered");
-  return json({ agent });
+  return json(payload);
 }
 
 function clientIp(req: Request): string | undefined {
