@@ -50,6 +50,7 @@ import {
   MIN_STAKE,
   PREFILLS,
   ZERO_ADDRESS,
+  formatDeadline,
   normalizeCategoryId,
   normalizeResolutionSource,
 } from "@/lib/constants";
@@ -1568,15 +1569,21 @@ export default function CreatePage() {
                                   {t("sourceDraftDeadline")}
                                 </div>
                                 <div className="mt-2 text-sm font-medium text-pv-text/90">
-                                  {hasDeadline
-                                    ? `${draftDeadline.toLocaleString(locale === "en" ? "en-US" : "es-AR", {
-                                        year: "numeric",
-                                        month: "short",
-                                        day: "numeric",
-                                        hour: "2-digit",
-                                        minute: "2-digit",
-                                      })} (${candidate.timezone})`
-                                    : candidate.deadlineAt}
+                                  {hasDeadline ? (
+                                    <>
+                                      {formatDeadline(
+                                        Math.floor(draftDeadline.getTime() / 1000),
+                                        locale === "en" ? "en" : "es"
+                                      )}
+                                      {candidate.timezone ? (
+                                        <span className="mt-1 block text-[11px] font-normal text-pv-muted">
+                                          Settlement rule timezone: {candidate.timezone}
+                                        </span>
+                                      ) : null}
+                                    </>
+                                  ) : (
+                                    candidate.deadlineAt
+                                  )}
                                 </div>
                               </div>
                               <div className="rounded-xl border border-pv-ink/[0.08] bg-pv-bg/60 p-3">
